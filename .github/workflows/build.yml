@@ -1,0 +1,129 @@
+name: Build tiny11
+
+on:
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: "EditionId to keep, e.g. Professional, Core, CoreCountrySpecific"
+        default: Professional
+      iso_sha256:
+        description: SHA-256 that Microsoft publishes for the source ISO
+        default: B795B52D598BF8FDEA5975844731F4A50C5713876CEFC513884354272B023AF0
+
+permissions:
+  contents: read
+
+env:
+  # ntdevlabs/tiny11builder, branch winui-preview, as reviewed on 2026-11-24.
+  T11_COMMIT: 38f7ab6b1f177098c026a19b73ec84bca9c4b874
+  T11_SCRIPT_SHA256: 7a7baffa75742d9ae9512936d72887931c8bc2a91ac16ccd451a8869752b6f5e
+  T11_UNATTEND_SHA256: ed9837ab4a19c812d28e20f5278ca5bb25815a6a01d1caddbce157be5d519dba
+  EDITION: ${{ inputs.edition }}
+  ISO_SHA256: ${{ inputs.iso_sha256 }}
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Pick work drive
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version
+          (Get-Item "$env:SystemRoot\System32\dism.exe").VersionInfo.ProductVersion
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free -AutoSize
+          $d = Get-PSDrive -PSProvider FileSystem | Sort-Object Free -Descending | Select-Object -First 1
+          if ($d.Free -lt 45GB) { throw "need 45 GB free, largest drive $($d.Name): has $([math]::Round($d.Free / 1GB)) GB" }
+          $work = "$($d.Name):\t11"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Add-Content $env:GITHUB_ENV "WORK=$work"
+
+      - name: Fetch pinned tiny11maker
+        run: |
+          $base = "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/$env:T11_COMMIT"
+          $pinned = @{ 'tiny11maker.ps1' = $env:T11_SCRIPT_SHA256; 'autounattend.xml' = $env:T11_UNATTEND_SHA256 }
+          foreach ($f in $pinned.Keys) {
+            curl.exe -fsSL --retry 3 -o "$env:WORK\$f" "$base/$f"
+            if ($LASTEXITCODE) { throw "download of $f failed (curl exit $LASTEXITCODE)" }
+            $got = (Get-FileHash "$env:WORK\$f" -Algorithm SHA256).Hash
+            if ($got -ne $pinned[$f]) { throw "$f hash $got differs from the reviewed $($pinned[$f])" }
+          }
+
+      - name: Download and verify source ISO
+        env:
+          ISO_URL: ${{ secrets.ISO_URL }}
+        run: |
+          if (-not $env:ISO_URL) { throw "secret ISO_URL is not set" }
+          $iso = "$env:WORK\source.iso"
+          $start = Get-Date
+          curl.exe -fsSL --retry 5 --retry-all-errors -C - -o $iso "$env:ISO_URL"
+          if ($LASTEXITCODE) { throw "ISO download failed (curl exit $LASTEXITCODE)" }
+          "{0:N2} GiB in {1:N1} min" -f ((Get-Item $iso).Length / 1GB), ((Get-Date) - $start).TotalMinutes
+          $got = (Get-FileHash $iso -Algorithm SHA256).Hash
+          if ($got -ne $env:ISO_SHA256) { throw "source ISO hash $got differs from Microsoft's $env:ISO_SHA256" }
+          "source ISO SHA-256 verified: $got"
+
+      - name: Select edition
+        run: |
+          $letter = (Mount-DiskImage -ImagePath "$env:WORK\source.iso" -PassThru | Get-Volume).DriveLetter
+          if (-not $letter) { throw "mounted ISO got no drive letter" }
+          $img = "${letter}:\sources\install.wim"
+          if (-not (Test-Path $img)) { $img = "${letter}:\sources\install.esd" }
+          $all = Get-WindowsImage -ImagePath $img | ForEach-Object { Get-WindowsImage -ImagePath $img -Index $_.ImageIndex }
+          $all | Format-Table ImageIndex, EditionId, Version, Languages -AutoSize
+          $pick = @($all | Where-Object { $_.EditionId -eq $env:EDITION })
+          if ($pick.Count -ne 1) { throw "expected one image with EditionId $env:EDITION, found $($pick.Count)" }
+          Add-Content $env:GITHUB_ENV "ISO_LETTER=$letter"
+          Add-Content $env:GITHUB_ENV "T11_INDEX=$($pick[0].ImageIndex)"
+
+      - name: Run tiny11maker
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          # tiny11maker.ps1 is interactive: answer its index prompt and skip its console clears.
+          function global:Read-Host { $env:T11_INDEX }
+          function global:Clear-Host { }
+          # The script relies on PowerShell's default error mode; Actions presets 'Stop'.
+          $ErrorActionPreference = 'Continue'
+          $scratch = $env:WORK.Substring(0, 1)
+          & "$env:WORK\tiny11maker.ps1" -ISO $env:ISO_LETTER -SCRATCH $scratch
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "$env:WORK\tiny11.iso")) { throw "tiny11.iso was not produced" }
+          $global:LASTEXITCODE = 0
+
+      - name: Inspect result
+        run: |
+          $iso = "$env:WORK\tiny11.iso"
+          $letter = (Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter
+          $img = "${letter}:\sources\install.wim"
+          $all = @(Get-WindowsImage -ImagePath $img)
+          if ($all.Count -ne 1) { throw "expected one image in the result, found $($all.Count)" }
+          $one = Get-WindowsImage -ImagePath $img -Index 1
+          $one | Format-List EditionId, Version, Languages, Architecture, ImageSize
+          if ($one.EditionId -ne $env:EDITION) { throw "result edition is $($one.EditionId), expected $env:EDITION" }
+          Dismount-DiskImage -ImagePath $iso | Out-Null
+          $hash = (Get-FileHash $iso -Algorithm SHA256).Hash.ToLower()
+          Set-Content "$env:WORK\tiny11.iso.sha256" "$hash  tiny11.iso" -Encoding ascii
+          "tiny11.iso: {0:N2} GiB, SHA-256 {1}" -f ((Get-Item $iso).Length / 1GB), $hash
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v7
+        with:
+          name: tiny11
+          path: |
+            ${{ env.WORK }}\tiny11.iso
+            ${{ env.WORK }}\tiny11.iso.sha256
+            ${{ env.WORK }}\tiny11_*.log
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tiny11-log
+          path: ${{ env.WORK }}\tiny11_*.log
+          retention-days: 1
+          if-no-files-found: ignore
